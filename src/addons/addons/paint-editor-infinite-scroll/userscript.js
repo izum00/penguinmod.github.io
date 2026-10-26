@@ -1,147 +1,87 @@
 export default async function ({ addon, console }) {
+
   const paper = await addon.tab.traps.getPaper();
-  const vm = addon.tab.traps.vm;
   const s = addon.settings;
   addon.tab.redux.initialize();
 
-  const BIG = 1e7;
-  const CORE_MIN_ZOOM = 0.333; // OUTERMOST_ZOOM_LEVEL in the core
-  const CROSSHAIR_SIZE = 16; // CROSSHAIR_SIZE in the core
-  const CELL = 8; // checkerboard cell size (art board units)
+  const paintView = await import("scratch-paint/src/helper/view.js");
+  const { getSelectedRootItems } = await import("scratch-paint/src/helper/selection.js");
+  const { updateViewBounds } = await import("scratch-paint/src/reducers/view-bounds.js");
+  const { isVector } = await import("scratch-paint/src/lib/format.js");
+  const BIG = 1e7; // MAX_WORKSPACE_BOUNDS in helper/view.js Risk of a loss in decimal precision
+  const CELL = 8; // CHECKERBOARD_SIZE in helper/layer.js
   const PERIOD = CELL * 2;
   const TILE_OPACITY = 0.55;
   const MAX_TILE_POINTS = 20000;
+  const PERCENT_PER_ZOOM = 100;
 
   let enabled = !!s.get("enable-default");
   let prevDefault = enabled;
-  let allowOnce = false; // lets exactly one scrollBy call through
-  let passing = false; // true while dispatching our own synthetic wheel event
+  let allowOnce = false;
   let wasActive = false;
-  let translateUsesScrollBy = false;
   let gridDirty = true;
 
   const hasView = () => !!(paper.project && paper.project.view && paper.project.view.element);
-  const isActive = () => !addon.self.disabled && enabled && hasView();
   const isVectorFormat = () => {
     const f = addon.tab.redux.state?.scratchPaint?.format;
-    return typeof f === "string" ? f.startsWith("VECTOR") : true;
+    return typeof f === "string" ? isVector(f) : true; // fallback to true if the format is not yet known
   };
+  const isActive = () => !addon.self.disabled && enabled && hasView() && isVectorFormat();
 
-  // ---------- Synthetic wheel events (the core wheel handler does the actual work) ----------
-  const dispatchWheel = (deltaX, deltaY, ctrlKey, clientX, clientY) => {
+  const getArtSize = () => ({ w: paintView.ART_BOARD_WIDTH, h: paintView.ART_BOARD_HEIGHT });
+
+  const refresh = (clipEmpty = false) => {
+    // force the view bounds and scroll to update
     if (!hasView()) return;
-    const canvas = paper.view.element;
-    const r = canvas.getBoundingClientRect();
-    passing = true;
-    try {
-      canvas.dispatchEvent(
-        new WheelEvent("wheel", {
-          bubbles: true,
-          cancelable: true,
-          deltaX,
-          deltaY,
-          deltaMode: 0,
-          ctrlKey: !!ctrlKey,
-          clientX: clientX ?? r.left + r.width / 2,
-          clientY: clientY ?? r.top + r.height / 2,
-        })
-      );
-    } finally {
-      passing = false;
-    }
+    if (clipEmpty) paintView.setWorkspaceBounds(true);
+    paintView.clampViewBounds();
+    addon.tab.redux.dispatch(updateViewBounds(paper.view.matrix));
   };
-  // A zero-delta pan makes the core recompute the workspace bounds and update the scrollbars.
-  const refresh = () => dispatchWheel(0, 0, false);
 
-  // ---------- 1. view.scrollBy / view.center ----------
-  const findDescriptor = (obj, key) => {
-    for (let o = obj; o; o = Object.getPrototypeOf(o)) {
-      const d = Object.getOwnPropertyDescriptor(o, key);
-      if (d) return d;
-    }
-    return null;
+  //  MAX_WORKSPACE_BOUNDS 
+  const layersReady = () => {
+    if (!paper.project) return false;
+    const layer = paper.project.layers.find((l) => l.data && l.data.isBackgroundGuideLayer);
+    return !!(layer && layer.vectorBackground);
   };
-  // Checks whether view.translate() goes through view.scrollBy() internally.
-  const detectTranslateUsesScrollBy = (view) => {
-    if (typeof view.translate !== "function") return false;
-    let called = false;
-    const original = view.scrollBy;
-    view.scrollBy = function (...args) {
-      called = true;
-      return original.apply(this, args);
-    };
-    try {
-      view.translate(new paper.Point(0, 0));
-    } catch (e) {
-      // ignore
+  const maxEnlarged = () => paintView.MAX_WORKSPACE_BOUNDS.width >= BIG;
+
+  const applyMax = (active) => {
+    const r = paintView.MAX_WORKSPACE_BOUNDS;
+    if (active) {
+      if (r.width >= BIG || !layersReady()) return false;
+      r.x = -BIG;
+      r.y = -BIG;
+      r.width = BIG * 2;
+      r.height = BIG * 2;
+      return true;
     }
-    view.scrollBy = original;
-    return called;
+    if (r.width < BIG) return false;
+    const { w, h } = getArtSize();
+    r.x = -w / 4;
+    r.y = -h / 4;
+    r.width = w * 1.5;
+    r.height = h * 1.5;
+    return true;
   };
+
+  //  Stop the core from pushing the view back into the workspace 
   const installView = (view) => {
     if (view.__saInfiniteInstalled) return;
     view.__saInfiniteInstalled = true;
     wasActive = false;
-    translateUsesScrollBy = detectTranslateUsesScrollBy(view);
     const origScrollBy = view.scrollBy;
     view.scrollBy = function (...args) {
-      if (!isActive()) return origScrollBy.apply(this, args);
+      if (!isActive() || !maxEnlarged()) return origScrollBy.apply(this, args);
       if (allowOnce) {
         allowOnce = false;
         return origScrollBy.apply(this, args);
       }
-      return this; // swallow the core's "push the view back into the workspace" scrolling
+      return this;
     };
-    const centerDesc = findDescriptor(view, "center");
-    if (centerDesc && centerDesc.get && centerDesc.set) {
-      Object.defineProperty(view, "center", {
-        configurable: true,
-        get() {
-          return centerDesc.get.call(this);
-        },
-        set(v) {
-          if (!isActive()) return centerDesc.set.call(this, v);
-          // Intentional center changes (e.g. zoom to fit) are allowed.
-          origScrollBy.call(this, new paper.Point(v).subtract(centerDesc.get.call(this)));
-        },
-      });
-    }
   };
 
-  // ---------- 2. Enlarge MAX_WORKSPACE_BOUNDS (found by hooking Rectangle#expand) ----------
-  let maxRect = null;
-  let maxOrig = null;
-  const applyMax = (active) => {
-    if (!maxRect || !maxOrig) return;
-    if (active) {
-      maxRect.x = -BIG;
-      maxRect.y = -BIG;
-      maxRect.width = BIG * 2;
-      maxRect.height = BIG * 2;
-    } else {
-      maxRect.x = maxOrig.x;
-      maxRect.y = maxOrig.y;
-      maxRect.width = maxOrig.width;
-      maxRect.height = maxOrig.height;
-    }
-  };
-  const rectProto = paper.Rectangle.prototype;
-  const origExpand = rectProto.expand;
-  rectProto.expand = function (...args) {
-    if (this !== maxRect) {
-      const w = vm.runtime.stageWidth * 2;
-      const h = vm.runtime.stageHeight * 2;
-      if (this.x === -w / 4 && this.y === -h / 4 && this.width === w * 1.5 && this.height === h * 1.5) {
-        maxRect = this;
-        maxOrig = { x: this.x, y: this.y, width: this.width, height: this.height };
-        if (isActive()) applyMax(true);
-      }
-    }
-    return origExpand.apply(this, args);
-  };
-
-  // ---------- 3. Clip mask of the painting layer (vector only) ----------
-  // In bitmap mode the mask matches the raster and must stay as it is.
+  //  Clip mask of the painting layer 
   let maskCache = null;
   const findMask = () => {
     const layer = paper.project.layers.find((l) => l.data && l.data.isPaintingLayer);
@@ -164,11 +104,12 @@ export default async function ({ addon, console }) {
     if (active) {
       if (mask.size.width < BIG) mask.size = new paper.Size(BIG * 2, BIG * 2);
     } else if (mask.size.width >= BIG) {
-      mask.size = new paper.Size(vm.runtime.stageWidth * 2 * 1.5, vm.runtime.stageHeight * 2 * 1.5);
+      const { w, h } = getArtSize();
+      mask.size = new paper.Size(w * 1.5, h * 1.5);
     }
   };
 
-  // ---------- 4. Infinite checkerboard grid ----------
+  //  Infinite checkerboard grid 
   let grid = null;
   const getBackgroundLayer = () =>
     paper.project.layers.find((l) => l.data && l.data.isBackgroundGuideLayer);
@@ -190,18 +131,14 @@ export default async function ({ addon, console }) {
       tile: pick(() => vb.children[1].children[1].fillColor, "#D9E3F2"),
     };
   };
-  // Phase of the original checkerboard: a cell is shaded when (col + row) % 2 === parity.
-  // Read from the original path so our grid lines up with it exactly.
   const readParity = () => {
     const layer = getBackgroundLayer();
     try {
-      const path = isVectorFormat()
-        ? layer.vectorBackground.children[1].children[1]
-        : layer.bitmapBackground.children[1];
+      const path = layer.vectorBackground.children[1].children[1];
       const o = path.localToGlobal(path.firstSegment.point);
       return (Math.round(o.x / CELL) + Math.round(o.y / CELL)) & 1;
     } catch (e) {
-      return isVectorFormat() ? 1 : 0;
+      return 1;
     }
   };
 
@@ -213,23 +150,11 @@ export default async function ({ addon, console }) {
     group.locked = true;
     layer.addChild(group);
     if (layer.dragCrosshair) group.insertBelow(layer.dragCrosshair);
-    grid = {
-      group,
-      fill: null,
-      white: null,
-      tiles: null,
-      block: null,
-      parity: -1,
-      artW: 0,
-      artH: 0,
-      tilesOn: null,
-      colors: {},
-    };
+    grid = { group, fill: null, white: null, tiles: null, block: null, sig: "", colors: {} };
     return grid;
   };
 
   const buildCheckerPoints = (ox, oy, cols, rows) => {
-    // Same zigzag trick as the core: with the even-odd rule it forms a checkerboard.
     const pts = [];
     let x = 0;
     let y = 0;
@@ -250,13 +175,13 @@ export default async function ({ addon, console }) {
     return pts;
   };
 
-  const rebuildGrid = (g, vb, parity, artW, artH, tilesOn) => {
+  const rebuildGrid = (g, vb, parity, art, tilesOn, sig) => {
     const span = Math.max(vb.width, vb.height);
     const x0 = Math.floor((vb.left - span) / PERIOD) * PERIOD - PERIOD;
     const y0 = Math.floor((vb.top - span) / PERIOD) * PERIOD - PERIOD;
     const x1 = Math.ceil((vb.right + span) / PERIOD) * PERIOD + PERIOD;
     const y1 = Math.ceil((vb.bottom + span) / PERIOD) * PERIOD + PERIOD;
-    const cols = (x1 - x0) / CELL - parity * 2; // keep column and row counts even
+    const cols = (x1 - x0) / CELL - parity * 2;
     const rows = (y1 - y0) / CELL;
 
     const style = (item) => {
@@ -266,7 +191,7 @@ export default async function ({ addon, console }) {
       return item;
     };
     const fill = style(new paper.Path.Rectangle({ from: [x0, y0], to: [x1, y1], insert: false }));
-    const white = style(new paper.Path.Rectangle({ point: [0, 0], size: [artW, artH], insert: false }));
+    const white = style(new paper.Path.Rectangle({ point: [0, 0], size: [art.w, art.h], insert: false }));
     const tiles = style(
       new paper.Path({
         segments: buildCheckerPoints(x0 + parity * CELL, y0, cols, rows),
@@ -283,19 +208,23 @@ export default async function ({ addon, console }) {
     g.white = white;
     g.tiles = tiles;
     g.block = { x0: x0 + PERIOD, y0: y0 + PERIOD, x1: x1 - PERIOD, y1: y1 - PERIOD };
-    g.parity = parity;
-    g.artW = artW;
-    g.artH = artH;
-    g.tilesOn = tilesOn;
+    g.sig = sig;
     g.colors = {};
   };
 
-  const needsRebuild = (g, vb, parity, artW, artH, tilesOn) => {
+  const needsRebuild = (g, vb, sig) => {
     const b = g.block;
-    if (!b || !g.fill) return true;
-    if (g.parity !== parity || g.artW !== artW || g.artH !== artH || g.tilesOn !== tilesOn) return true;
+    if (!b || !g.fill || g.sig !== sig) return true;
     if (vb.left < b.x0 || vb.top < b.y0 || vb.right > b.x1 || vb.bottom > b.y1) return true;
-    return b.x1 - b.x0 > Math.max(vb.width, vb.height) * 12; // zoomed in a lot: shrink the block
+    return b.x1 - b.x0 > Math.max(vb.width, vb.height) * 12;
+  };
+
+  const updateGridColors = (g) => {
+    const c = readColors();
+    if (g.colors.workspace !== c.workspace) g.fill.fillColor = c.workspace;
+    if (g.colors.white !== c.white) g.white.fillColor = c.white;
+    if (g.colors.tile !== c.tile) g.tiles.fillColor = c.tile;
+    g.colors = c;
   };
 
   const updateGrid = () => {
@@ -312,84 +241,27 @@ export default async function ({ addon, console }) {
 
     const vb = paper.view.bounds;
     const parity = readParity();
-    const artW = vm.runtime.stageWidth * 2;
-    const artH = vm.runtime.stageHeight * 2;
-    const tilesOn = CELL * paper.view.zoom >= 2; // skip sub-pixel cells
-    if (needsRebuild(g, vb, parity, artW, artH, tilesOn)) {
-      rebuildGrid(g, vb, parity, artW, artH, tilesOn);
-    }
-
-    const c = readColors();
-    if (g.colors.workspace !== c.workspace) g.fill.fillColor = c.workspace;
-    if (g.colors.white !== c.white) g.white.fillColor = c.white;
-    if (g.colors.tile !== c.tile) g.tiles.fillColor = c.tile;
-    g.colors = c;
+    const art = getArtSize();
+    const tilesOn = CELL * paper.view.zoom >= 2;
+    const sig = [parity, art.w, art.h, tilesOn].join(",");
+    if (needsRebuild(g, vb, sig)) rebuildGrid(g, vb, parity, art, tilesOn, sig);
+    updateGridColors(g);
   };
 
-  // Poll the view transform each frame (paper has no "view moved" event).
-  let lastSig = [];
-  let warned = false;
-  const loop = () => {
-    requestAnimationFrame(loop);
-    try {
-      if (!hasView()) return;
-      const m = paper.view.matrix;
-      const vs = paper.view.viewSize;
-      const sig = [m.a, m.b, m.c, m.d, m.tx, m.ty, vs.width, vs.height];
-      if (!gridDirty && sig.every((v, i) => v === lastSig[i])) return;
-      lastSig = sig;
-      gridDirty = false;
-      updateGrid();
-    } catch (e) {
-      if (!warned) {
-        warned = true;
-        console.error(e);
-      }
-    }
-  };
-  requestAnimationFrame(loop);
-
-  // ---------- State sync ----------
-  const sync = () => {
-    if (!hasView()) return;
-    installView(paper.project.view);
-    const active = isActive();
-    applyMax(active);
-    applyMask(active);
-    gridDirty = true;
-    if (active !== wasActive) {
-      wasActive = active;
-      refresh();
-      refresh(); // the first call captures the Rectangle, the second recomputes the range
-    }
-  };
-  let scheduled = false;
-  const scheduleSync = () => {
-    if (scheduled) return;
-    scheduled = true;
-    queueMicrotask(() => {
-      scheduled = false;
-      sync();
-    });
-  };
-  addon.tab.redux.addEventListener("statechanged", scheduleSync);
-  addon.self.addEventListener("disabled", scheduleSync);
-  addon.self.addEventListener("reenabled", scheduleSync);
-
-  // ---------- Zoom ----------
+  //  Zoom 
   const zoomStep = (z) =>
     0.5 * (s.get("zoom-speed") / 100) * Math.pow(z / 0.5, s.get("zoom-correction") / 100);
   const clampZoom = (z) => {
+    if (!isActive()) return Math.max(paintView.OUTERMOST_ZOOM_LEVEL, z);
     const minZ = s.get("min-zoom") / 100;
     let maxZ = s.get("max-zoom") / 100;
     maxZ = maxZ > 0 ? Math.max(maxZ, minZ) : Infinity;
     return Math.max(minZ, Math.min(maxZ, z));
   };
-  // Zoom out is the inverse of zoom in, so the buttons are reversible.
   const nextButtonZoom = (z, zoomIn) => {
     if (zoomIn) {
       let t = z + zoomStep(z);
-      if (z < 0.5 - 1e-6 && t > 0.5) t = 0.5; // keep the default zoom as a stop, like the original
+      if (z < 0.5 - 1e-6 && t > 0.5) t = 0.5;
       return Math.max(z, clampZoom(t));
     }
     let lo = 0;
@@ -402,86 +274,56 @@ export default async function ({ addon, console }) {
     return Math.min(z, clampZoom((lo + hi) / 2));
   };
 
-  // Zoom below the core's minimum level, which the core cannot do by itself.
-  const ownZoom = (target, clientX, clientY) => {
+  const zoomAt = (target, fixedPoint) => {
     const view = paper.view;
-    const rect = view.element.getBoundingClientRect();
-    const fixedPoint = view.viewToProject(new paper.Point(clientX - rect.left, clientY - rect.top));
-    const preCenter = view.center;
+    if (!(target > 0) || target === view.zoom) return;
+    const preZoomCenter = view.center;
     const scaling = view.zoom / target;
-    const preOffset = fixedPoint.subtract(preCenter);
-    const postOffset = fixedPoint.subtract(preOffset.multiply(scaling)).subtract(preCenter);
+    const preZoomOffset = fixedPoint.subtract(preZoomCenter);
+    const postZoomOffset = fixedPoint.subtract(preZoomOffset.multiply(scaling)).subtract(preZoomCenter);
     view.zoom = target;
-    allowOnce = translateUsesScrollBy;
-    view.translate(postOffset.multiply(-1));
-    allowOnce = false;
-    for (const layer of paper.project.layers) {
-      if (layer.dragCrosshair) {
-        layer.dragCrosshair.scale(CROSSHAIR_SIZE / layer.dragCrosshair.bounds.width / view.zoom);
-      }
-    }
+    view.translate(postZoomOffset.multiply(-1));
+    paintView.resizeCrosshair();
     refresh();
     addon.tab.redux.dispatch({ type: "scratch-paint/select/REDRAW_SELECTION_BOX" });
   };
 
-  const applyZoom = (target, clientX, clientY) => {
-    const view = paper.view;
-    if (target >= CORE_MIN_ZOOM) {
-      // The core adds deltaY / -500 to the zoom, so send exactly the delta we need.
-      allowOnce = translateUsesScrollBy;
-      dispatchWheel(0, -(target - view.zoom) * 500, true, clientX, clientY);
-      allowOnce = false;
-    } else {
-      ownZoom(target, clientX, clientY);
+  const getZoomAnchor = () => {
+    const items = getSelectedRootItems();
+    if (items.length > 0) {
+      let rect = null;
+      for (const item of items) rect = rect ? rect.unite(item.bounds) : item.bounds;
+      return rect.center;
     }
+    return paper.view.center;
   };
 
-  // Anchor for the zoom buttons: the center of the selection, or the center of the view.
-  const getZoomAnchorClient = () => {
-    const view = paper.view;
-    const rect = view.element.getBoundingClientRect();
-    try {
-      const layer = paper.project.layers.find((l) => l.data && l.data.isPaintingLayer);
-      const items = paper.project.selectedItems.filter((i) => i.parent === layer);
-      if (items.length) {
-        let b = items[0].bounds;
-        for (const item of items) b = b.unite(item.bounds);
-        const p = view.projectToView(b.center);
-        return { x: rect.left + p.x, y: rect.top + p.y };
-      }
-    } catch (e) {
-      // fall through to the view center
-    }
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  };
-
-  // Wheel: ctrl/pinch zoom is handled here, plain wheel only needs to be allowed to scroll.
   window.addEventListener(
     "wheel",
     (e) => {
-      if (passing || !isActive() || e.target !== paper.view.element) return;
+      if (!isActive() || e.target !== paper.view.element) return;
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
         e.stopImmediatePropagation();
         const view = paper.view;
         const mult = e.deltaMode === 1 ? 15 : 1;
-        const base = -(e.deltaY * mult) / 500; // same formula as the core
+        const base = -(e.deltaY * mult) / 500;
         if (!base) return;
         const scaled = base * (s.get("zoom-speed") / 100) * Math.pow(view.zoom / 0.5, s.get("zoom-correction") / 100);
         let target = clampZoom(view.zoom + scaled);
         target = scaled > 0 ? Math.max(view.zoom, target) : Math.min(view.zoom, target);
-        if (target !== view.zoom) applyZoom(target, e.clientX, e.clientY);
+        const rect = view.element.getBoundingClientRect();
+        zoomAt(target, view.viewToProject(new paper.Point(e.clientX - rect.left, e.clientY - rect.top)));
       } else {
-        allowOnce = true; // only the first scrollBy of the core pan() may pass
-        setTimeout(() => {
-          allowOnce = false;
-        }, 0);
+        allowOnce = true;
       }
     },
     { capture: true, passive: false }
   );
+  window.addEventListener("wheel", () => {
+    allowOnce = false;
+  });
 
-  // Zoom in / zoom out buttons (index 1 is the "reset zoom" button, which is left alone).
   window.addEventListener(
     "click",
     (e) => {
@@ -490,21 +332,19 @@ export default async function ({ addon, console }) {
       if (!(t instanceof Element)) return;
       const controls = t.closest("[class*='paint-editor_zoom-controls']");
       if (!controls) return;
-      const group = controls.firstElementChild;
-      if (!group) return;
-      const index = Array.from(group.children).findIndex((b) => b.contains(t));
-      if (index !== 0 && index !== 2) return;
+      const icon = Array.from(controls.querySelectorAll("img")).find(
+        (i) => i === t || (i.parentElement && i.parentElement.contains(t))
+      );
+      const alt = icon && icon.getAttribute("alt");
+      if (alt !== "Zoom In" && alt !== "Zoom Out") return;
       e.preventDefault();
       e.stopImmediatePropagation();
-      const target = nextButtonZoom(paper.view.zoom, index === 2);
-      if (target === paper.view.zoom) return;
-      const p = getZoomAnchorClient();
-      applyZoom(target, p.x, p.y);
+      zoomAt(nextButtonZoom(paper.view.zoom, alt === "Zoom In"), getZoomAnchor());
     },
     true
   );
 
-  // ---------- Scrollbar thumbs follow the cursor ----------
+  //  Scrollbar thumbs follow the cursor 
   window.addEventListener(
     "mousedown",
     (e) => {
@@ -520,13 +360,13 @@ export default async function ({ addon, console }) {
       const tb = track.getBoundingClientRect();
       const thumbLen = horizontal ? hb.width : hb.height;
       const trackLen = horizontal ? tb.width : tb.height;
-      if (!thumbLen || thumbLen >= trackLen * 0.995) return; // everything is visible: use the core behavior
+      if (!thumbLen || !trackLen || thumbLen >= trackLen * 0.995) return;
 
       e.preventDefault();
       e.stopImmediatePropagation();
 
-      // Fixed at drag start: view units per thumb pixel (= workspace length / track length).
-      const unitsPerPx = (horizontal ? paper.view.bounds.width : paper.view.bounds.height) / thumbLen;
+      const ws = paintView.getWorkspaceBounds();
+      const unitsPerPx = (horizontal ? ws.width : ws.height) / trackLen;
       let last = horizontal ? e.clientX : e.clientY;
 
       const onMove = (ev) => {
@@ -534,10 +374,8 @@ export default async function ({ addon, console }) {
         const units = (cur - last) * unitsPerPx;
         last = cur;
         if (!units) return;
-        const d = units * paper.view.zoom; // the core divides by zoom
-        allowOnce = true;
-        dispatchWheel(horizontal ? d : 0, horizontal ? 0 : d, false);
-        allowOnce = false;
+        paper.view.translate(new paper.Point(horizontal ? -units : 0, horizontal ? 0 : -units));
+        refresh();
         ev.preventDefault();
       };
       const onUp = () => {
@@ -550,21 +388,57 @@ export default async function ({ addon, console }) {
     true
   );
 
-  // ---------- Button ----------
+  //  UI: zoom percentage + button 
   const group = document.createElement("div");
   group.className = "sa-paint-infinite-group";
   addon.tab.displayNoneWhileDisabled(group);
 
+  const zoomInput = document.createElement("input");
+  zoomInput.className = "sa-paint-infinite-zoom";
+  zoomInput.type = "text";
+  zoomInput.title = "Zoom (click to edit)";
+  zoomInput.setAttribute("aria-label", "Zoom");
+  zoomInput.spellcheck = false;
+  group.appendChild(zoomInput);
+
+  const currentPercent = () => Math.round(paper.view.zoom * PERCENT_PER_ZOOM);
+  const updateZoomLabel = () => {
+    if (!hasView() || document.activeElement === zoomInput) return;
+    const text = `${currentPercent()}%`;
+    if (zoomInput.value !== text) zoomInput.value = text;
+  };
+  zoomInput.addEventListener("focus", () => {
+    if (!hasView()) return;
+    zoomInput.value = String(currentPercent());
+    zoomInput.select();
+  });
+  zoomInput.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      const percent = parseFloat(zoomInput.value.replace("%", ""));
+      if (hasView() && Number.isFinite(percent) && percent > 0) {
+        zoomAt(clampZoom(percent / PERCENT_PER_ZOOM), paper.view.center);
+      }
+      zoomInput.blur();
+    } else if (e.key === "Escape") {
+      zoomInput.blur();
+    }
+  });
+  zoomInput.addEventListener("blur", () => {
+    zoomInput.setSelectionRange(0, 0);
+    updateZoomLabel();
+  });
+
   const button = document.createElement("span");
   button.className = "sa-paint-infinite-button";
   button.setAttribute("role", "button");
-  button.title = "Infinite scroll";
+  button.title = "Infinite scroll (vector only)";
   button.dataset.enabled = enabled;
 
   const img = document.createElement("img");
   img.className = "sa-paint-infinite-image";
   img.draggable = false;
-  img.src = addon.self.getResource("/icons/infinite.svg") /* rewritten by pull.js */;
+  img.src = addon.self.getResource("/icons/infinite.svg");
   button.appendChild(img);
   group.appendChild(button);
 
@@ -575,8 +449,40 @@ export default async function ({ addon, console }) {
   });
 
   const updateVisibility = () => {
-    group.dataset.hidden = String(!s.get("show-button"));
+    const showButton = !!s.get("show-button");
+    const showZoom = !!s.get("show-zoom-percent");
+    button.style.display = showButton ? "" : "none";
+    zoomInput.style.display = showZoom ? "" : "none";
+    group.dataset.hidden = String(!isVectorFormat() || (!showButton && !showZoom));
   };
+
+  //  State sync 
+  const sync = () => {
+    if (!hasView()) return;
+    installView(paper.project.view);
+    const active = isActive();
+    const maxChanged = applyMax(active);
+    applyMask(active);
+    updateVisibility();
+    gridDirty = true;
+    if (active !== wasActive || maxChanged) {
+      wasActive = active;
+      refresh();
+    }
+  };
+  let scheduled = false;
+  const scheduleSync = () => {
+    if (scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      sync();
+    });
+  };
+  addon.tab.redux.addEventListener("statechanged", scheduleSync);
+  addon.self.addEventListener("disabled", scheduleSync);
+  addon.self.addEventListener("reenabled", scheduleSync);
+
   s.addEventListener("change", () => {
     const d = !!s.get("enable-default");
     if (d !== prevDefault) {
@@ -584,13 +490,37 @@ export default async function ({ addon, console }) {
       enabled = d;
       button.dataset.enabled = enabled;
     }
-    updateVisibility();
     sync();
   });
-  updateVisibility();
+
+  //  Per-frame polling 
+  let lastSig = [];
+  let warned = false;
+  const loop = () => {
+    requestAnimationFrame(loop);
+    try {
+      if (!hasView()) return;
+      if (isActive() && !maxEnlarged() && layersReady()) sync();
+      if (grid && grid.fill && grid.group.visible && isActive()) updateGridColors(grid);
+      const m = paper.view.matrix;
+      const vs = paper.view.viewSize;
+      const sig = [m.a, m.b, m.c, m.d, m.tx, m.ty, vs.width, vs.height];
+      if (!gridDirty && sig.every((v, i) => v === lastSig[i])) return;
+      lastSig = sig;
+      gridDirty = false;
+      updateGrid();
+      updateZoomLabel();
+    } catch (e) {
+      if (!warned) {
+        warned = true;
+        console.error(e);
+      }
+    }
+  };
+  requestAnimationFrame(loop);
   sync();
 
-  // ---------- Place the button next to the zoom controls ----------
+  //  Place the group next to the zoom controls 
   let hasRunOnce = false;
   while (true) {
     const canvasControls = await addon.tab.waitForElement("[class^='paint-editor_canvas-controls']", {
@@ -621,5 +551,6 @@ export default async function ({ addon, console }) {
       img.className += " " + imageClass;
     }
     sync();
+    updateZoomLabel();
   }
 }

@@ -71,7 +71,14 @@ const manifest = {
       "default": 50,
       "min": 0,
       "max": 100
-    }
+    },
+    {
+      "dynamic": true,
+      "type": "boolean",
+      "id": "show-zoom-percent",
+      "name": "Show the zoom percentage next to the zoom buttons",
+      "default": true
+    },
   ],
   "dynamicDisable": true,
   "enabledByDefault": true
