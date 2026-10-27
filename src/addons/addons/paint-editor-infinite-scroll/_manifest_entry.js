@@ -2,7 +2,7 @@ const manifest = {
   "editorOnly": true,
   "noTranslations": true,
   "name": "Costume editor infinite scroll",
-  "description": "Removes the limits on the drawing area and scrolling range when editing vectors and bitmaps. The minimum and maximum zoom levels, zoom speed, and zoom correction can also be configured. Zoom correction compensates for the phenomenon where zooming in becomes harder at high magnification.",
+  "description": "Removes drawing area and scrolling limits. Allows customization of zoom levels, speed, and correction.",
   "tags": [],
   "userscripts": [
     {
@@ -19,14 +19,14 @@ const manifest = {
       "dynamic": true,
       "type": "boolean",
       "id": "show-button",
-      "name": "Show the infinite scroll button",
+      "name": "Show the ∞ scroll button",
       "default": true
     },
     {
       "dynamic": true,
       "type": "boolean",
       "id": "infinite-grid",
-      "name": "Extend the checkerboard grid infinitely",
+      "name": "Extend the checkerboard grid",
       "default": true
     },
     {
