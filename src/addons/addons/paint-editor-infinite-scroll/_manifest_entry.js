@@ -25,13 +25,6 @@ const manifest = {
     {
       "dynamic": true,
       "type": "boolean",
-      "id": "enable-default",
-      "name": "Enable infinite scroll by default",
-      "default": true
-    },
-    {
-      "dynamic": true,
-      "type": "boolean",
       "id": "infinite-grid",
       "name": "Extend the checkerboard grid infinitely",
       "default": true
