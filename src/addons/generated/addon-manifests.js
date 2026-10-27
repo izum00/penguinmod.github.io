@@ -6,7 +6,7 @@ import _middle_click_popup from "../addons/middle-click-popup/_manifest_entry.js
 import _editor_block_chomping from "../addons/editor-block-chomping/_manifest_entry.js";
 import _paint_gradient_maker from "../addons/paint-gradient-maker/_manifest_entry.js";
 import _paint_tool_panel from "../addons/paint-tool-panel/_manifest_entry.js";
-import _paint_tool_panel from "../addons/paint-tool-panel/_manifest_entry.js";
+import _paint_editor_infinite_scroll from "../addons/paint-editor-infinite-scroll/_manifest_entry.js";
 import _paint_rounded_rect_seperate from "../addons/paint-rounded-rect-seperate/_manifest_entry.js";
 import _paint_default_smoothing from "../addons/paint-default-smoothing/_manifest_entry.js";
 import _jump_to_def from "../addons/jump-to-def/_manifest_entry.js";
