@@ -16,10 +16,10 @@ export default async function ({ addon, console }) {
   const PERCENT_PER_ZOOM = 100;
 
   const STORAGE_KEY = "sa-paint-infinite-enabled";
+  const storedEnabled = localStorage.getItem(STORAGE_KEY);
+  let enabled = storedEnabled === null ? true : storedEnabled === "true";
+  if (storedEnabled === null) localStorage.setItem(STORAGE_KEY, String(enabled));
 
-  let enabled = localStorage.getItem(STORAGE_KEY) !== null ? localStorage.getItem(STORAGE_KEY) === "true" : !!s.get("enable-default");
-
-  let prevDefault = !!s.get("enable-default");
   let allowOnce = false;
   let wasActive = false;
   let gridDirty = true;
@@ -488,12 +488,6 @@ export default async function ({ addon, console }) {
   addon.self.addEventListener("reenabled", scheduleSync);
 
   s.addEventListener("change", () => {
-    const d = !!s.get("enable-default");
-    if (d !== prevDefault) {
-      prevDefault = d;
-      enabled = d;
-      button.dataset.enabled = enabled;
-    }
     sync();
   });
 
