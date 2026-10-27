@@ -15,8 +15,11 @@ export default async function ({ addon, console }) {
   const MAX_TILE_POINTS = 20000;
   const PERCENT_PER_ZOOM = 100;
 
-  let enabled = !!s.get("enable-default");
-  let prevDefault = enabled;
+  const STORAGE_KEY = "sa-paint-infinite-enabled";
+
+  let enabled = localStorage.getItem(STORAGE_KEY) !== null ? localStorage.getItem(STORAGE_KEY) === "true" : !!s.get("enable-default");
+
+  let prevDefault = !!s.get("enable-default");
   let allowOnce = false;
   let wasActive = false;
   let gridDirty = true;
@@ -444,6 +447,7 @@ export default async function ({ addon, console }) {
 
   button.addEventListener("click", () => {
     enabled = !enabled;
+    localStorage.setItem(STORAGE_KEY, String(enabled));
     button.dataset.enabled = enabled;
     sync();
   });
